@@ -96,6 +96,25 @@ func (b *BytesBatcher) Push(appendFunc func(dst []byte, rows int) []byte) bool {
 	return true
 }
 
+// Flush triggers immediate processing of all accumulated items in the current batch.
+func (b *BytesBatcher) Flush() (ok bool) {
+	b.lock.Lock()
+	defer b.lock.Unlock()
+
+	if b.items <= 0 {
+		return true
+	}
+
+	for i := 0; i < 10; i++ {
+		if b.execNolockBlock() {
+			return true
+		}
+		time.Sleep(time.Second)
+	}
+
+	return false
+}
+
 func (b *BytesBatcher) init() {
 	go func() {
 		maxDelay := b.MaxDelay
@@ -122,6 +141,26 @@ func (b *BytesBatcher) execNolockNocheck() {
 	// may be still pending in BatchFunc.
 	// The error will be discovered on the next Push.
 	b.execNolock(true)
+}
+
+func (b *BytesBatcher) execNolockBlock() bool {
+	if len(b.pendingB) > 0 {
+		return false
+	}
+	if b.FooterFunc != nil {
+		b.b = b.FooterFunc(b.b)
+	}
+	b.pendingB = append(b.pendingB[:0], b.b...)
+	b.b = b.b[:0]
+
+	b.lastExecTime = time.Now()
+
+	b.BatchFunc(b.pendingB, b.items)
+
+	b.pendingB = b.pendingB[:0]
+	b.items = 0
+
+	return true
 }
 
 func (b *BytesBatcher) execNolock(parallel bool) bool {
