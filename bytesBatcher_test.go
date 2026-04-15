@@ -125,6 +125,64 @@ func TestBytesBatcherTriggerPushOverflow(t *testing.T) {
 	}
 }
 
+func TestBytesBatcherTriggerMaxBatchBytesSize(t *testing.T) {
+	type result struct {
+		b     string
+		items int
+	}
+
+	resultCh := make(chan result, 2)
+	bb := &BytesBatcher{
+		BatchFunc: func(b []byte, items int) {
+			resultCh <- result{b: string(b), items: items}
+		},
+		MaxBatchSize:      100,
+		MaxBatchBytesSize: 5,
+		MaxDelay:          time.Hour,
+	}
+
+	push := func(s string) {
+		ok := bb.Push(func(b []byte, _ int) []byte {
+			return append(b, s...)
+		})
+		if !ok {
+			t.Fatalf("cannot push %q", s)
+		}
+	}
+
+	push("ab")
+	push("cd")
+	push("ef")
+
+	select {
+	case <-time.After(time.Second):
+		t.Fatalf("timeout waiting for the first batch")
+	case got := <-resultCh:
+		if got.b != "abcd" {
+			t.Fatalf("unexpected first batch payload: %q; want %q", got.b, "abcd")
+		}
+		if got.items != 2 {
+			t.Fatalf("unexpected first batch items: %d; want %d", got.items, 2)
+		}
+	}
+
+	if !bb.Flush() {
+		t.Fatalf("flush failed")
+	}
+
+	select {
+	case <-time.After(time.Second):
+		t.Fatalf("timeout waiting for the second batch")
+	case got := <-resultCh:
+		if got.b != "ef" {
+			t.Fatalf("unexpected second batch payload: %q; want %q", got.b, "ef")
+		}
+		if got.items != 1 {
+			t.Fatalf("unexpected second batch items: %d; want %d", got.items, 1)
+		}
+	}
+}
+
 func TestBytesBatcherConcurrent(t *testing.T) {
 	header := "foo"
 	footer := "bar"

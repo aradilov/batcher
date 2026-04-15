@@ -41,8 +41,11 @@ type BytesBatcher struct {
 	// FooterFunc may be nil.
 	FooterFunc func(dst []byte) []byte
 
-	// MaxBatchSize the the maximum batch size.
+	// MaxBatchSize the maximum batch size.
 	MaxBatchSize int
+
+	// MaxBatchBytesSize specifies the maximum size in bytes for a batch before it triggers processing.
+	MaxBatchBytesSize int
 
 	// MaxDelay is the maximum duration before BatchFunc is called
 	// unless MaxBatchSize is reached.
@@ -87,10 +90,25 @@ func (b *BytesBatcher) Push(appendFunc func(dst []byte, rows int) []byte) bool {
 			b.b = b.HeaderFunc(b.b)
 		}
 	}
+	sizeBefore := len(b.b)
 	b.b = appendFunc(b.b, b.items)
+	sizeAfter := len(b.b)
+	execDueBatchBytesSize := b.MaxBatchBytesSize > 0 && sizeAfter >= b.MaxBatchBytesSize
 	b.items++
-	if b.items >= b.MaxBatchSize {
+	execDueBatchSize := b.items >= b.MaxBatchSize
+
+	if execDueBatchSize || execDueBatchBytesSize {
+		var overhead []byte
+		if execDueBatchBytesSize {
+			b.items--
+			overhead = b.b[sizeBefore:]
+			b.b = b.b[:sizeBefore]
+		}
 		b.execNolockNocheck()
+		if overhead != nil {
+			b.b = append(b.b, overhead...)
+			b.items++
+		}
 	}
 	b.lock.Unlock()
 	return true
