@@ -56,6 +56,7 @@ type BytesBatcher struct {
 	lock         sync.Mutex
 	b            []byte
 	pendingB     []byte
+	overflowB    []byte
 	items        int
 	lastExecTime time.Time
 }
@@ -77,40 +78,50 @@ func (b *BytesBatcher) Stop() {
 func (b *BytesBatcher) Push(appendFunc func(dst []byte, rows int) []byte) bool {
 	b.once.Do(b.init)
 	b.lock.Lock()
+	defer b.lock.Unlock()
 	if b.stopped {
-		b.lock.Unlock()
 		return false
 	}
 	if b.items >= b.MaxBatchSize && !b.execNolock(true) {
-		b.lock.Unlock()
 		return false
 	}
 	if b.items == 0 {
-		if b.HeaderFunc != nil {
-			b.b = b.HeaderFunc(b.b)
-		}
+		b.writeHeader()
 	}
 	sizeBefore := len(b.b)
 	b.b = appendFunc(b.b, b.items)
-	sizeAfter := len(b.b)
-	execDueBatchBytesSize := b.MaxBatchBytesSize > 0 && sizeAfter >= b.MaxBatchBytesSize
 	b.items++
-	execDueBatchSize := b.items >= b.MaxBatchSize
-
-	if execDueBatchSize || execDueBatchBytesSize {
-		var overhead []byte
-		if execDueBatchBytesSize {
-			b.items--
-			overhead = b.b[sizeBefore:]
-			b.b = b.b[:sizeBefore]
+	if b.MaxBatchBytesSize == 0 {
+		if b.items >= b.MaxBatchSize {
+			b.execNolockNocheck()
 		}
-		b.execNolockNocheck()
-		if overhead != nil {
-			b.b = append(b.b, overhead...)
-			b.items++
-		}
+		return true
 	}
-	b.lock.Unlock()
+
+	sizeBeforeFooter := len(b.b)
+	b.writeFooter()
+	sizeWithFooter := len(b.b)
+	b.b = b.b[:sizeBeforeFooter]
+	if sizeWithFooter == b.MaxBatchBytesSize || (sizeWithFooter > b.MaxBatchBytesSize && b.items == 1) {
+		b.execNolockNocheck()
+		return true
+	}
+	if sizeWithFooter > b.MaxBatchBytesSize {
+		b.overflowB = append(b.overflowB, b.b[sizeBefore:sizeBeforeFooter]...)
+		b.b = b.b[:sizeBefore]
+		b.items--
+
+		b.execNolockBlock()
+
+		b.writeHeader()
+		b.b = append(b.b, b.overflowB...)
+		b.items++
+		b.overflowB = b.overflowB[:0]
+		return true
+	}
+	if b.items >= b.MaxBatchSize {
+		b.execNolockNocheck()
+	}
 	return true
 }
 
@@ -165,9 +176,7 @@ func (b *BytesBatcher) execNolockBlock() bool {
 	if len(b.pendingB) > 0 {
 		return false
 	}
-	if b.FooterFunc != nil {
-		b.b = b.FooterFunc(b.b)
-	}
+	b.writeFooter()
 	b.pendingB = append(b.pendingB[:0], b.b...)
 	b.b = b.b[:0]
 
@@ -185,9 +194,7 @@ func (b *BytesBatcher) execNolock(parallel bool) bool {
 	if len(b.pendingB) > 0 {
 		return false
 	}
-	if b.FooterFunc != nil {
-		b.b = b.FooterFunc(b.b)
-	}
+	b.writeFooter()
 	b.pendingB = append(b.pendingB[:0], b.b...)
 	b.b = b.b[:0]
 	items := b.items
@@ -215,4 +222,16 @@ func (b *BytesBatcher) execNolock(parallel bool) bool {
 	}
 
 	return true
+}
+
+func (b *BytesBatcher) writeHeader() {
+	if b.HeaderFunc != nil {
+		b.b = b.HeaderFunc(b.b)
+	}
+}
+
+func (b *BytesBatcher) writeFooter() {
+	if b.FooterFunc != nil {
+		b.b = b.FooterFunc(b.b)
+	}
 }

@@ -130,56 +130,196 @@ func TestBytesBatcherTriggerMaxBatchBytesSize(t *testing.T) {
 		b     string
 		items int
 	}
-
-	resultCh := make(chan result, 2)
-	bb := &BytesBatcher{
-		BatchFunc: func(b []byte, items int) {
-			resultCh <- result{b: string(b), items: items}
+	tests := []struct {
+		name     string
+		header   string
+		footer   string
+		maxBytes int
+		maxItems int
+		pushes   []string
+		expected []result
+	}{
+		{
+			name:     "maxBytes == len on 1st flush",
+			maxBytes: 4,
+			pushes:   []string{"ab", "cd", "ef"},
+			expected: []result{{b: "abcd", items: 2}, {b: "ef", items: 1}},
 		},
-		MaxBatchSize:      100,
-		MaxBatchBytesSize: 5,
-		MaxDelay:          time.Hour,
+		{
+			name:     "maxBytes > len on 1st flush",
+			maxBytes: 5,
+			pushes:   []string{"ab", "cd", "ef"},
+			expected: []result{{b: "abcd", items: 2}, {b: "ef", items: 1}},
+		},
+		{
+			name:     "1 char header, maxBytes == len on 1st flush",
+			header:   "_",
+			maxBytes: 5,
+			pushes:   []string{"ab", "cd", "ef"},
+			expected: []result{{b: "_abcd", items: 2}, {b: "_ef", items: 1}},
+		},
+		{
+			name:     "1 char header, maxBytes > len on 1st flush",
+			header:   "_",
+			maxBytes: 6,
+			pushes:   []string{"ab", "cd", "ef"},
+			expected: []result{{b: "_abcd", items: 2}, {b: "_ef", items: 1}},
+		},
+		{
+			name:     "2 char header, maxBytes == len on 1st flush",
+			header:   "__",
+			maxBytes: 6,
+			pushes:   []string{"ab", "cd", "ef"},
+			expected: []result{{b: "__abcd", items: 2}, {b: "__ef", items: 1}},
+		},
+		{
+			name:     "2 char header, maxBytes > len on 1st flush",
+			header:   "__",
+			maxBytes: 7,
+			pushes:   []string{"ab", "cd", "ef"},
+			expected: []result{{b: "__abcd", items: 2}, {b: "__ef", items: 1}},
+		},
+		{
+			name:     "1 char footer, maxBytes == len on 1st flush",
+			footer:   ";",
+			maxBytes: 5,
+			pushes:   []string{"ab", "cd", "ef"},
+			expected: []result{{b: "abcd;", items: 2}, {b: "ef;", items: 1}},
+		},
+		{
+			name:     "1 char footer, maxBytes > len on 1st flush",
+			footer:   ";",
+			maxBytes: 6,
+			pushes:   []string{"ab", "cd", "ef"},
+			expected: []result{{b: "abcd;", items: 2}, {b: "ef;", items: 1}},
+		},
+		{
+			name:     "2 char footer, maxBytes == len on 1st flush",
+			footer:   ";;",
+			maxBytes: 6,
+			pushes:   []string{"ab", "cd", "ef"},
+			expected: []result{{b: "abcd;;", items: 2}, {b: "ef;;", items: 1}},
+		},
+		{
+			name:     "2 char footer, maxBytes > len on 1st flush",
+			footer:   ";;",
+			maxBytes: 7,
+			pushes:   []string{"ab", "cd", "ef"},
+			expected: []result{{b: "abcd;;", items: 2}, {b: "ef;;", items: 1}},
+		},
+		{
+			name:     "1 char header and footer, maxBytes == len on 1st flush",
+			header:   "_",
+			footer:   ";",
+			maxBytes: 6,
+			pushes:   []string{"ab", "cd", "ef"},
+			expected: []result{{b: "_abcd;", items: 2}, {b: "_ef;", items: 1}},
+		},
+		{
+			name:     "1 char header and footer, maxBytes > len on 1st flush",
+			header:   "_",
+			footer:   ";",
+			maxBytes: 7,
+			pushes:   []string{"ab", "cd", "ef"},
+			expected: []result{{b: "_abcd;", items: 2}, {b: "_ef;", items: 1}},
+		},
+		{
+			name:     "multi-char header and footer, maxBytes == len on 1st flush",
+			header:   "___",
+			footer:   ";;;",
+			maxBytes: 10,
+			pushes:   []string{"ab", "cd", "ef"},
+			expected: []result{{b: "___abcd;;;", items: 2}, {b: "___ef;;;", items: 1}},
+		},
+		{
+			name:     "multi-char header and footer, maxBytes > len on 1st flush",
+			header:   "___",
+			footer:   ";;;",
+			maxBytes: 11,
+			pushes:   []string{"ab", "cd", "ef"},
+			expected: []result{{b: "___abcd;;;", items: 2}, {b: "___ef;;;", items: 1}},
+		},
+		{
+			name:     "maxBytes < len should process at least 1 element",
+			header:   "___",
+			footer:   ";;;",
+			maxBytes: 1,
+			pushes:   []string{"ab", "cd", "ef"},
+			expected: []result{{b: "___ab;;;", items: 1}, {b: "___cd;;;", items: 1}, {b: "___ef;;;", items: 1}},
+		},
+		{
+			name:     "MaxBatchSize should also work when maxBytes is provided",
+			header:   "_",
+			footer:   ";",
+			maxBytes: 20,
+			maxItems: 2,
+			pushes:   []string{"ab", "cd", "ef"},
+			expected: []result{{b: "_abcd;", items: 2}, {b: "_ef;", items: 1}},
+		},
 	}
 
-	push := func(s string) {
-		ok := bb.Push(func(b []byte, _ int) []byte {
-			return append(b, s...)
+	for _, tt := range tests {
+		tt := tt
+		var name string
+		if tt.header != "" {
+			name += "header=" + tt.header + ","
+		}
+		if tt.footer != "" {
+			name += "footer=" + tt.footer + ","
+		}
+		name += fmt.Sprintf("maxBytes=%d,pushes=", tt.maxBytes)
+
+		t.Run(tt.name, func(t *testing.T) {
+			resultCh := make(chan result, len(tt.expected))
+			maxItems := tt.maxItems
+			if maxItems == 0 {
+				maxItems = len(tt.pushes) + 1
+			}
+			bb := &BytesBatcher{
+				BatchFunc: func(b []byte, items int) {
+					resultCh <- result{b: string(b), items: items}
+				},
+				HeaderFunc: func(b []byte) []byte {
+					return append(b, tt.header...)
+				},
+				FooterFunc: func(b []byte) []byte {
+					return append(b, tt.footer...)
+				},
+				MaxBatchSize:      maxItems,
+				MaxBatchBytesSize: tt.maxBytes,
+				MaxDelay:          time.Hour,
+			}
+
+			for _, s := range tt.pushes {
+				ok := bb.Push(func(b []byte, _ int) []byte {
+					return append(b, s...)
+				})
+				if !ok {
+					t.Fatalf("cannot push %q", s)
+				}
+				time.Sleep(1 * time.Millisecond)
+			}
+
+			for i, expected := range tt.expected {
+				if i == len(tt.expected)-1 {
+					if !bb.Flush() {
+						t.Fatalf("flush failed")
+					}
+				}
+
+				select {
+				case <-time.After(time.Second):
+					t.Fatalf("timeout waiting for the batch")
+				case got := <-resultCh:
+					if got.b != expected.b {
+						t.Fatalf("unexpected batch payload: %q; want %q", got.b, expected.b)
+					}
+					if got.items != expected.items {
+						t.Fatalf("unexpected batch items: %d; want %d", got.items, expected.items)
+					}
+				}
+			}
 		})
-		if !ok {
-			t.Fatalf("cannot push %q", s)
-		}
-	}
-
-	push("ab")
-	push("cd")
-	push("ef")
-
-	select {
-	case <-time.After(time.Second):
-		t.Fatalf("timeout waiting for the first batch")
-	case got := <-resultCh:
-		if got.b != "abcd" {
-			t.Fatalf("unexpected first batch payload: %q; want %q", got.b, "abcd")
-		}
-		if got.items != 2 {
-			t.Fatalf("unexpected first batch items: %d; want %d", got.items, 2)
-		}
-	}
-
-	if !bb.Flush() {
-		t.Fatalf("flush failed")
-	}
-
-	select {
-	case <-time.After(time.Second):
-		t.Fatalf("timeout waiting for the second batch")
-	case got := <-resultCh:
-		if got.b != "ef" {
-			t.Fatalf("unexpected second batch payload: %q; want %q", got.b, "ef")
-		}
-		if got.items != 1 {
-			t.Fatalf("unexpected second batch items: %d; want %d", got.items, 1)
-		}
 	}
 }
 
